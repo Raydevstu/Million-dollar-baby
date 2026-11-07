@@ -1,0 +1,117 @@
+# Job steps
+
+Postgres is the queue. `public.jobs` is the only work list. `claim_next_job(worker_id)` locks one queued row with `FOR UPDATE SKIP LOCKED` and marks it `running`.
+
+Idempotency keys:
+
+- `extract_audio:{videoId}`
+- `transcribe:{videoId}`
+- `highlight:{videoId}`
+- `render_clip:{clipId}`
+
+A unique index on `idempotency_key` makes a retry insert a no-op.
+
+## 1. extract_audio
+
+Input: `videos.storage_path` in bucket `videos`.
+
+1. Download the object to local disk via a signed URL (do not buffer a 500 MB file in the API process).
+2. Reject if file size > 500 MB.
+3. `ffprobe` the duration. Reject if missing or > 3600 seconds. Write `videos.duration_seconds`.
+4. Check `usage_monthly` for the UTC month. Reject before any OpenAI call if `seconds_processed + duration > plan quota`.
+5. Extract audio:
+
+```
+ffmpeg -y -i source -vn -ac 1 -ar 16000 -b:a 64k audio.mp3
+```
+
+6. On success, enqueue `transcribe:{videoId}`.
+
+Failure sets `videos.processing_status = failed` and `videos.error`. Validation failures are not retried. Network and ffmpeg failures retry up to 3 attempts.
+
+## 2. transcribe
+
+Model: `whisper-1`. `response_format=verbose_json`. `timestamp_granularities=["word","segment"]`.
+
+1. Split audio into 600-second chunks (re-encoded, not stream-copy, so cuts are exact):
+
+```
+ffmpeg -y -i audio.mp3 -f segment -segment_time 600 -reset_timestamps 1 -ac 1 -ar 16000 -b:a 64k chunk_%03d.mp3
+```
+
+2. Probe each chunk duration. Offset later words by the sum of previous chunk durations, not by `index * 600`.
+3. Send each chunk. Pass the previous chunk's last 200 characters as `prompt` so names survive the seam.
+4. If a chunk file is over 20 MB, fail that job. 64 kbps × 10 minutes is about 4.8 MB, so this means extraction regressed.
+5. Concatenate words. Drop empty tokens. Require `end > start`.
+6. Insert `transcripts` (`text`, `words`, `model`).
+7. Increment `usage_monthly.seconds_processed` by the probed duration, once. The unique transcript row is the charge record: if `transcripts.video_id` already exists, do not charge again.
+8. Enqueue `highlight:{videoId}`.
+
+## 3. highlight
+
+The model never sees the video. It sees numbered transcript lines with start and end.
+
+Output schema, validated in code before insert:
+
+```json
+{
+  "candidates": [
+    {
+      "start": 118.4,
+      "end": 147.9,
+      "hook_score": 92,
+      "payoff_score": 84,
+      "emotion_score": 77,
+      "clarity_score": 88,
+      "hook_type": "contrarian",
+      "reason": "Opens by rejecting the obvious advice, then gives a concrete counterexample inside 8 seconds.",
+      "first_line": "Stop posting the highlight.",
+      "risk": "Needs the prior sentence if you cut before 118s.",
+      "quote": "Stop posting the highlight. Post the argument."
+    }
+  ]
+}
+```
+
+Code then:
+
+- Rejects a candidate whose `quote` is not a substring of the transcript (whitespace-normalized).
+- Rejects hook types outside `contrarian | story | number | advice | emotion | other`.
+- Computes `clip_score = round(0.40*hook + 0.25*payoff + 0.20*emotion + 0.15*clarity)`.
+- Snaps start/end to word boundaries, pads 0.15s, then forces the range into 15–60 seconds by walking words.
+- Drops overlaps (keep the higher score).
+- Inserts at most 5 rows, ranked. The UI shows all of them; Free can export 3 per month.
+
+`videos.processing_status` becomes `ready` even if only one candidate survives. Zero survivors is a failed highlight, not a failed transcript.
+
+## 4. render_clip
+
+User-triggered. Not chained automatically.
+
+1. Confirm the clip belongs to the caller and export quota remains.
+2. Build an ASS file from words inside the snapped range. Lines of 4 words. Karaoke `\\kf` on each word. Preset only: Arial 72, white fill, black outline, bottom-center, 1080×1920.
+3. Cut and burn:
+
+```
+ffmpeg -y -ss {start} -i source -t {duration} \
+  -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass={captions}" \
+  -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -movflags +faststart out.mp4
+```
+
+Free plan appends `drawtext` with `CLIPMVP` before the ASS filter.
+
+4. Thumbnail at 0.5 seconds into the clip:
+
+```
+ffmpeg -y -ss {start+0.5} -i source -frames:v 1 -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" thumb.jpg
+```
+
+5. Upload both to bucket `exports`. Set `clips.status = ready`. Increment `usage_monthly.exports_count` only after the upload succeeds.
+
+`-ss` before `-i` is fast and can be a few frames early. Word padding of 0.15s covers that for v1. Do not run this command inside a Vercel function.
+
+## Charging rules
+
+- Transcript minutes are charged only after a successful transcript insert.
+- Export count is charged only after the MP4 upload succeeds.
+- A retried job with the same idempotency key must not double-charge. The code checks for an existing transcript or `export_path` before calling the paid API or ffmpeg render.
